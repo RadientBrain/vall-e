@@ -23,11 +23,19 @@ class AR(Base):
     def norm_type(self):
         return "ln"
 
+    @property
+    def resp_loss_only(self):
+        return False
+
     def _prune(self, l: Tensor):
         indices = (l == self.stop_token).nonzero()
         if len(indices) == 0:
             return l
         return l[: indices.min().item()]
+
+    @staticmethod
+    def _unsqueeze_list(x_list, axis=-1):
+        return [x.unsqueeze(dim=axis) for x in x_list]
 
     def forward(
         self,
@@ -35,25 +43,32 @@ class AR(Base):
         proms_list: list[Tensor],
         resp_list: list[Tensor] | None = None,
         max_steps: int = 1000,
+        sampling_temperature: float = 1.0,
     ):
         if resp_list is not None:
             return super().forward(
                 text_list,
                 proms_list,
-                resp_list,
+                self._unsqueeze_list(resp_list),
                 resp_list,
                 quant_levels=None,
                 shift_targ_list=True,
                 return_all_resp=False,
             )
         else:
-            return self._generate(text_list, proms_list, max_steps)
+            return self._generate(
+                text_list,
+                proms_list,
+                max_steps,
+                sampling_temperature,
+            )
 
     def _generate(
         self,
         text_list: list[Tensor],
         proms_list: list[Tensor],
         max_steps: int,
+        sampling_temperature: float,
     ):
         device = text_list[0].device
         resp_list: list[Tensor] = [
@@ -61,7 +76,12 @@ class AR(Base):
         ]
         stopped = torch.zeros(len(text_list), device=device).bool()
         for _ in trange(max_steps):
-            r = super().forward(text_list, proms_list, resp_list)
+            r = super().forward(
+                text_list,
+                proms_list,
+                self._unsqueeze_list(resp_list),
+                sampling_temperature=sampling_temperature,
+            )
             stopped |= r == self.stop_token
             for i, ri in enumerate(r):
                 resp_list[i] = torch.cat([resp_list[i], ri[None]])
@@ -89,7 +109,7 @@ def example_usage():
         torch.tensor([2, 3], device=device),
     ]
 
-    x8 = partial(repeat, pattern="t -> t q", q=8)
+    x8 = partial(repeat, pattern="t -> t l", l=8)
     proms_list = [
         x8(torch.tensor([1, 2, 3], device=device)),
         x8(torch.tensor([2, 3], device=device)),

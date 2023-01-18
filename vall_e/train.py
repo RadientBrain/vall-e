@@ -76,13 +76,15 @@ def main():
                     text_list=batch["text"],
                     proms_list=batch["proms"],
                     max_steps=cfg.max_val_ar_steps,
+                    sampling_temperature=cfg.sampling_temperature,
                 )
                 resps_list = [r.unsqueeze(-1) for r in resp_list]
             elif cfg.model.startswith("nar"):
                 resps_list = model(
                     text_list=batch["text"],
                     proms_list=batch["proms"],
-                    resp_list=batch["resp"],
+                    resps_list=[r.unsqueeze(-1) for r in batch["resp"]],
+                    sampling_temperature=cfg.sampling_temperature,
                 )
             else:
                 raise NotImplementedError(cfg.model)

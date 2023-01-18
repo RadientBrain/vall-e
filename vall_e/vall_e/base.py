@@ -4,7 +4,7 @@ from typing import Literal, overload
 
 import torch
 import torch.nn.functional as F
-from einops import rearrange, repeat
+from einops import rearrange
 from torch import Tensor, einsum, nn
 from torch.distributions import Categorical
 from torch.nn.utils.rnn import pad_sequence
@@ -31,6 +31,7 @@ def list_to_tensor(x_list: list[Tensor], pattern="t b c -> b t c"):
     m = _create_mask(l, x_list[0].device)
     m = m.t().unsqueeze(-1)  # (t b 1)
     m = rearrange(m, pattern)
+    m = m.to(x)
     return x, m
 
 
@@ -240,55 +241,34 @@ class Embedding(nn.Embedding):
         return super().forward(torch.cat(x_list)).split([*map(len, x_list)])
 
 
-class AdditiveMultiEmbedding(nn.Embedding):
+class MultiEmbedding(nn.Module):
     """
-    This embedding sums embeddings from all levels.
+    This embedding sums embeddings on different levels.
     """
 
-    def __init__(self, n_levels, n_tokens, token_dim):
-        self.n_levels = n_levels
+    def __init__(self, max_n_levels, n_tokens, token_dim):
+        super().__init__()
+        self.max_n_levels = max_n_levels
         self.n_tokens = n_tokens
-        super().__init__(n_levels * n_tokens, token_dim)
+        self.weight = nn.Parameter(torch.randn(max_n_levels, n_tokens, token_dim))
 
     def forward(self, x_list: list[Tensor]) -> list[Tensor]:
         if len(x_list) == 0:
             return []
-        x = torch.cat(x_list)
-        assert x.shape[1] == self.n_levels
-        w = rearrange(self.weight, "(q k) d -> q k d", q=self.n_levels)
-        x = F.one_hot(x, num_classes=self.n_tokens).float()  # n q -> n q k
-        x = einsum("q k d, n q k -> n d", w, x)
+
+        w = self.weight
+
+        padded_x_list = []
+
+        for xi in x_list:
+            xi = F.one_hot(xi, num_classes=self.n_tokens)  # t l' k
+            xi = F.pad(xi, (0, 0, 0, w.shape[0] - xi.shape[1]))  # t l k
+            padded_x_list.append(xi.to(w))
+
+        x = torch.cat(padded_x_list)  # n l k
+        x = einsum("l k d, n l k -> n d", w, x)
+
         x_list = x.split([*map(len, x_list)])
-        return x_list
-
-
-class SelectiveMultiEmbedding(nn.Embedding):
-    """
-    This embedding pick up the embedding at the certain level.
-    """
-
-    def __init__(self, n_levels, n_tokens_per_level, token_dim):
-        self.n_tokens_per_level = n_tokens_per_level
-        super().__init__(n_levels, n_tokens_per_level * token_dim)
-
-    def forward(self, x_list: list[Tensor], l: Tensor | None = None):
-        """
-        Args:
-            x_list: [(t)], tokens
-            l: (b), levels, if none, pick the first
-        """
-        x = pad_sequence(x_list, batch_first=True)  # b t
-
-        if l is not None:
-            w = super().forward(l)  # b d
-        else:
-            w = repeat(self.weight[0], "d -> b d", b=len(x))
-
-        w = rearrange(w, "b (k d) -> b k d", k=self.n_tokens_per_level)
-        x = F.one_hot(x, num_classes=self.n_tokens_per_level).float()  # b t k
-        x = einsum("b k d, b t k -> b t d", w, x)
-
-        x_list = [xi[:li] for xi, li in zip(x, map(len, x_list))]
 
         return x_list
 
@@ -326,6 +306,10 @@ class Base(nn.Module):
     def n_prom_levels(self) -> int:
         return 8
 
+    @property
+    def resp_loss_only(self):
+        raise NotImplementedError
+
     def __init__(
         self,
         n_tokens: int,
@@ -333,7 +317,6 @@ class Base(nn.Module):
         n_heads: int = 8,
         n_layers: int = 12,
         p_dropout: float = 0.1,
-        resp_loss_only: bool = False,
     ):
         super().__init__()
         self.n_tokens = n_tokens
@@ -346,14 +329,9 @@ class Base(nn.Module):
 
         self.text_emb = Embedding(n_tokens, d_model)
 
-        # It's not clear whether the whole prom are used or only the first level quantization
-        # Just use all of them as it is more sufficient and we don't need to sample it, or do we?
-        self.prom_emb = AdditiveMultiEmbedding(self.n_prom_levels, n_tokens, d_model)
-
-        if self.n_resp_levels:
-            self.resp_emb = SelectiveMultiEmbedding(
-                self.n_resp_levels, n_resp_tokens, d_model
-            )
+        # Here I simply use all prom levels
+        self.proms_emb = MultiEmbedding(self.n_prom_levels, n_tokens, d_model)
+        self.resps_emb = MultiEmbedding(self.n_resp_levels, n_resp_tokens, d_model)
 
         self.sin_emb = SinusodialEmbedding(d_model)
 
@@ -374,8 +352,6 @@ class Base(nn.Module):
         self.blocks = nn.ModuleList(blocks)
 
         self.classifier = nn.Linear(d_model, n_resp_tokens)
-
-        self.resp_loss_only = resp_loss_only
 
     @property
     def stop_token(self):
@@ -400,11 +376,12 @@ class Base(nn.Module):
         self,
         text_list: list[Tensor],
         proms_list: list[Tensor],
-        resp_list: list[Tensor],
+        resps_list: list[Tensor],
         targ_list: list[Tensor] | None = None,
         quant_levels: Tensor | None = None,
         shift_targ_list: bool = False,
         return_all_resp: Literal[False] = False,
+        sampling_temperature: float = 1.0,
     ) -> Tensor:
         ...
 
@@ -413,11 +390,12 @@ class Base(nn.Module):
         self,
         text_list: list[Tensor],
         proms_list: list[Tensor],
-        resp_list: list[Tensor],
+        resps_list: list[Tensor],
         targ_list: list[Tensor] | None = None,
         quant_levels: Tensor | None = None,
         shift_targ_list: bool = False,
         return_all_resp: Literal[True] = True,
+        sampling_temperature: float = 1.0,
     ) -> list[Tensor]:
         ...
 
@@ -425,28 +403,30 @@ class Base(nn.Module):
         self,
         text_list: list[Tensor],
         proms_list: list[Tensor],
-        resp_list: list[Tensor],
+        resps_list: list[Tensor],
         targ_list: list[Tensor] | None = None,
         quant_levels: Tensor | None = None,
         shift_targ_list: bool = False,
         return_all_resp: bool = False,
+        sampling_temperature: float = 1.0,
     ):
         """
         Args:
             text_list: [t] * b
-            proms_list: [t' k] * b
-            resp_list: [t''] * b, one quantization level only
+            proms_list: [t' l] * b, l quantization levels.
+            resps_list: [t'' l] * b, l quantization levels.
             targ_list: [t''] * b, one quantization level only, when given, loss will be computed
             quant_levels: specify which quant_levels to feed forward, used in NAR mode.
             shift_targ_list: whether to shift target list when computing loss. True if AR.
             return_all_resp: True if NAR.
+            sampling_temperature: a lower temperature makes the result more robust but less diverse.
         Returns:
             y: sampled tokens
         """
         x_list = self._samplewise_merge_tensors(
             self.text_emb(text_list),
-            self.prom_emb(proms_list),
-            self.resp_emb(resp_list, quant_levels),
+            self.proms_emb(proms_list),
+            self.resps_emb(resps_list),
             sep=self.sep,
         )
 
@@ -469,8 +449,11 @@ class Base(nn.Module):
 
             ignore_sep = torch.tensor(self.ignore_index, device=device)
 
-            # Predict the first level prom
-            prom_list = [t[..., 0] for t in proms_list]
+            # Ignore prom in the target
+            prom_list = [
+                torch.full_like(t[..., 0], self.ignore_index) for t in proms_list
+            ]
+
             text_prom_list = self._samplewise_merge_tensors(
                 text_list, prom_list, sep=ignore_sep
             )
@@ -504,10 +487,12 @@ class Base(nn.Module):
             )
 
         if return_all_resp:
-            logits = [hi[-li:] for hi, li in zip(h_list, map(len, resp_list))]
-            ret = [Categorical(logits=hi).sample() for hi in logits]
+            logits = [hi[-li:] for hi, li in zip(h_list, map(len, resps_list))]
+            ret = [
+                Categorical(logits=hi / sampling_temperature).sample() for hi in logits
+            ]
         else:
             logits = torch.stack([hi[-1] for hi in h_list])
-            ret = Categorical(logits=logits).sample()
+            ret = Categorical(logits=logits / sampling_temperature).sample()
 
         return ret

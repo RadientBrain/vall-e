@@ -44,16 +44,31 @@ class Config(ConfigBase):
     min_phones: int = 10
     max_phones: int = 50
 
+    use_fp16: bool = True
+    gradient_accumulation_steps: int = 1
+    sampling_temperature: float = 1.0
+
+    cache_dataloader: bool = False
+
     @cached_property
     def get_spkr(self):
         return eval(self.spkr_name_getter)
 
     @property
+    def fp16_cfg(self):
+        return {
+            "enabled": self.use_fp16,
+        }
+
+    @property
     def ds_cfg(self):
         return {
             "train_micro_batch_size_per_gpu": self.batch_size,
-            "gradient_accumulation_steps": 1,
-            "optimizer": {"type": "Adam"},
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "optimizer": {
+                "type": "Adam",
+                "lr": self.warmup_min_lr,
+            },
             "scheduler": {
                 "type": "WarmupDecayLR",
                 "params": {
@@ -65,6 +80,7 @@ class Config(ConfigBase):
                 },
             },
             "gradient_clipping": self.gradient_clipping,
+            "fp16": self.fp16_cfg,
         }
 
     @property
@@ -73,7 +89,9 @@ class Config(ConfigBase):
 
     @cached_property
     def diskcache(self):
-        return diskcache.Cache(self.cache_dir).memoize
+        if self.cache_dataloader:
+            return diskcache.Cache(self.cache_dir).memoize
+        return lambda: lambda x: x
 
 
 cfg = Config.from_cli()

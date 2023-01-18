@@ -1,4 +1,6 @@
-<img src="./vall-e.png" width="450px"></img>
+<p align="center">
+<img src="./vall-e.png" width="500px"></img>
+</p>
 
 # VALL-E
 
@@ -6,15 +8,27 @@ An unofficial PyTorch implementation of [VALL-E](https://valle-demo.github.io/),
 
 [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/enhuiz)
 
-## Install
+## Get Started
+
+### Requirements
+
+Since the trainer is based on [DeepSpeed](https://github.com/microsoft/DeepSpeed#requirements), you will need to have a GPU that DeepSpeed has developed and tested against, as well as a CUDA or ROCm compiler pre-installed to install this package.
+
+### Install
 
 ```
 pip install git+https://github.com/enhuiz/vall-e
 ```
 
-Note that the code is only tested under Python 3.10.7.
+Or you may clone by:
 
-## Usage
+```
+git clone --recurse-submodules https://github.com/enhuiz/vall-e.git
+```
+
+Note that the code is only tested under `Python 3.10.7`.
+
+### Training
 
 1. Put your data into a folder, e.g. `data/your_data`. Audio files should be named with the suffix `.wav` and text files with `.normalized.txt`.
 
@@ -38,6 +52,24 @@ python -m vall_e.emb.g2p data/your_data
 python -m vall_e.train yaml=config/your_data/ar_or_nar.yml
 ```
 
+You may quit your training any time by just typing `quit` in your CLI. The latest checkpoint will be automatically saved.
+
+6. Export trained models:
+
+Both trained models need to be exported to a certain path. To export either of them, run:
+
+```
+python -m vall_e.export zoo/ar_or_nar.pt yaml=config/your_data/ar_or_nar.yml
+```
+
+This will export the latest checkpoint.
+
+### Synthesis
+
+```
+python -m vall_e <text> <ref_path> <out_path> --ar-ckpt zoo/ar.pt --nar-ckpt zoo/nar.pt
+```
+
 ## TODO
 
 - [x] AR model for the first quantizer
@@ -47,6 +79,11 @@ python -m vall_e.train yaml=config/your_data/ar_or_nar.yml
 - [x] Implement AdaLN for NAR model.
 - [x] Sample-wise quantization level sampling for NAR training.
 - [ ] Pre-trained checkpoint and demos on LibriTTS
+- [x] Synthesis CLI
+
+## Notice
+
+- [EnCodec](https://github.com/facebookresearch/encodec) is licensed under CC-BY-NC 4.0. If you use the code to generate audio quantization or perform decoding, it is important to adhere to the terms of their license.
 
 ## Citations
 
