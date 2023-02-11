@@ -71,10 +71,6 @@ def _validate(path, min_phones, max_phones):
     return True
 
 
-def _get_spkr_name(path) -> str:
-    return cfg.get_spkr(path)
-
-
 class VALLEDatset(Dataset):
     def __init__(
         self,
@@ -102,14 +98,14 @@ class VALLEDatset(Dataset):
         self.paths_by_spkr_name = self._get_paths_by_spkr_name(extra_paths_by_spkr_name)
 
         self.paths = [
-            p for p in self.paths if len(self.paths_by_spkr_name[_get_spkr_name(p)]) > 1
+            p for p in self.paths if len(self.paths_by_spkr_name[cfg.get_spkr(p)]) > 1
         ]
 
-        if len(self.paths) == 0:
-            raise ValueError("No valid path is found. ")
+        if len(self.paths) == 0 and training:
+            raise ValueError("No valid path is found for training.")
 
         if training:
-            self.sampler = Sampler(self.paths, [_get_spkr_name])
+            self.sampler = Sampler(self.paths, [cfg.get_spkr])
         else:
             self.sampler = None
 
@@ -117,7 +113,7 @@ class VALLEDatset(Dataset):
         ret = defaultdict(list)
         for path in self.paths:
             if _get_quant_path(path).exists():
-                ret[_get_spkr_name(path)].append(path)
+                ret[cfg.get_spkr(path)].append(path)
         for k, v in extra_paths_by_spkr_name.items():
             ret[k].extend(v)
         return {**ret}
@@ -132,7 +128,7 @@ class VALLEDatset(Dataset):
 
     @cached_property
     def spkrs(self):
-        return sorted({_get_spkr_name(path) for path in self.paths})
+        return sorted({cfg.get_spkr(path) for path in self.paths})
 
     def _get_spkr_symmap(self):
         return {s: i for i, s in enumerate(self.spkrs)}
@@ -165,7 +161,7 @@ class VALLEDatset(Dataset):
         else:
             path = self.paths[index]
 
-        spkr_name = _get_spkr_name(path)
+        spkr_name = cfg.get_spkr(path)
         text = torch.tensor([*map(self.phone_symmap.get, _get_phones(path))])
         proms = self.sample_prompts(spkr_name, ignore=path)
         resps = _load_quants(path)
@@ -204,7 +200,7 @@ def _seed_worker(worker_id):
     random.seed(worker_seed)
 
 
-def _create_dl(dataset, training):
+def _create_dataloader(dataset, training):
     return DataLoader(
         dataset=dataset,
         batch_size=cfg.batch_size if training else cfg.eval_batch_size,
@@ -228,7 +224,7 @@ def _load_train_val_paths():
     if len(paths) == 0:
         raise RuntimeError(f"Failed to find any .qnt.pt file in {cfg.data_dirs}.")
 
-    pairs = sorted([(_get_spkr_name(p), p) for p in paths])
+    pairs = sorted([(cfg.get_spkr(p), p) for p in paths])
     del paths
 
     for _, group in groupby(pairs, lambda pair: pair[0]):
@@ -244,20 +240,14 @@ def _load_train_val_paths():
     return train_paths, val_paths
 
 
-def _load_test_paths():
-    test_paths = []
-    for data_dir in cfg.test_data_dirs:
-        test_paths.extend(data_dir.rglob("*.phn.txt"))
-    test_paths = sorted(test_paths)
-    return test_paths
-
-
 @cfg.diskcache()
 def create_datasets():
     train_paths, val_paths = _load_train_val_paths()
-    test_paths = _load_test_paths()
 
-    train_dataset = VALLEDatset(train_paths, training=True)
+    train_dataset = VALLEDatset(
+        train_paths,
+        training=True,
+    )
 
     val_dataset = VALLEDatset(
         val_paths,
@@ -266,44 +256,35 @@ def create_datasets():
         extra_paths_by_spkr_name=train_dataset.paths_by_spkr_name,
     )
 
-    val_dataset.interleaved_reorder_(_get_spkr_name)
+    val_dataset.interleaved_reorder_(cfg.get_spkr)
     val_dataset.head_(cfg.max_num_val)
 
-    test_dataset = VALLEDatset(
-        test_paths,
-        train_dataset.phone_symmap,
-        train_dataset.spkr_symmap,
-        extra_paths_by_spkr_name=train_dataset.paths_by_spkr_name,
-    )
-
-    return train_dataset, val_dataset, test_dataset
+    return train_dataset, val_dataset
 
 
 def create_train_val_dataloader():
-    train_dataset, val_dataset, test_dataset = create_datasets()
+    train_dataset, val_dataset = create_datasets()
 
-    train_dl = _create_dl(train_dataset, training=True)
-    val_dl = _create_dl(val_dataset, training=False)
-    test_dl = _create_dl(test_dataset, training=False)
+    train_dl = _create_dataloader(train_dataset, training=True)
+    val_dl = _create_dataloader(val_dataset, training=False)
 
     _logger.info(str(train_dataset.phone_symmap))
     _logger.info(str(train_dataset.spkr_symmap))
 
     _logger.info(f"#samples (train): {len(train_dataset)}.")
     _logger.info(f"#samples (val): {len(val_dataset)}.")
-    _logger.info(f"#samples (test): {len(test_dataset)}.")
 
-    train_for_val_dataset = copy.deepcopy(train_dataset)
-    train_for_val_dataset.interleaved_reorder_(_get_spkr_name)
-    train_for_val_dataset.head_(cfg.max_num_val)
-    train_for_val_dataset.training_(False)
-    train_for_val_dl = _create_dl(train_for_val_dataset, training=False)
-    assert isinstance(train_for_val_dl.dataset, VALLEDatset)
+    subtrain_dataset = copy.deepcopy(train_dataset)
+    subtrain_dataset.interleaved_reorder_(cfg.get_spkr)
+    subtrain_dataset.head_(cfg.max_num_val)
+    subtrain_dataset.training_(False)
+    subtrain_dl = _create_dataloader(subtrain_dataset, training=False)
+    assert isinstance(subtrain_dl.dataset, VALLEDatset)
 
-    return train_dl, train_for_val_dl, val_dl, test_dl
+    return train_dl, subtrain_dl, val_dl
 
 
 if __name__ == "__main__":
-    train_dl, train_for_val_dl, val_dl, test_dl = create_train_val_dataloader()
+    train_dl, subtrain_dl, val_dl = create_train_val_dataloader()
     sample = train_dl.dataset[0]
     print(sample)
